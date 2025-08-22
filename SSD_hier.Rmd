@@ -1,0 +1,513 @@
+---
+title: "SSD_Hier"
+output: html_document
+date: "2025-08-10"
+---
+## Sample Size Estimation (Hierarchical Simulations)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+##### Packages #####
+library(MCMCpack)
+library(matrixStats)
+library(DirichletReg)
+library(MASS)
+library(numDeriv)  
+library(Matrix)    
+library(extraDistr)
+library(gtools)
+library(tidyverse)   
+library(progress)      
+library(glue) 
+library(ggplot2)
+library(dplyr)
+```
+
+```{r}
+##### Helpers #####
+rdirichlet_safe <- function(n, alpha, eps = 1e-12) {
+  alpha <- pmax(as.numeric(alpha), eps)
+  extraDistr::rdirichlet(n, alpha)
+}
+
+ldirichlet_safe <- function(x, alpha, eps = 1e-12) {
+  if (any(!is.finite(x)) || any(x <= 0) || abs(sum(x) - 1) > 1e-8) return(-Inf)
+  alpha <- pmax(as.numeric(alpha), eps)
+  extraDistr::ddirichlet(x, alpha, log = TRUE)
+}
+```
+
+```{r}
+##### HBAMP informed priors #####
+omega_output <- mcmc_all_hans$omega_output# Unlist and prepare omega matrix
+omega_output_unlisted <- matrix(unlist(omega_output), nrow = 1001, ncol = 30)
+
+# Mean and Dirichlet parameters
+e_j <- apply(omega_output_unlisted, 2, mean) 
+alpha_noise <- mean(mcmc_all_hans$alpha_zero_output)
+alpha_hier <- mean(mcmc_all_hans$alpha_output)
+v_j <- alpha_hier * e_j
+v <- sum(v_j)
+eps <- 1e-8
+v_j <- pmax(v_j, eps)                   
+v_j <- v_j * (v / sum(v_j)) 
+
+```
+
+```{r}
+##### Region parameters #####
+alpha_region <- 0.05
+d <- 0.01
+posterior_success_threshold <- 1 - alpha_region
+```
+
+```{r}
+##### Simulation parameters #####
+## Fix candidate sample sizes
+n_neurons <- seq(100, 1000, by = 100)   # Candidate neuron sample sizes
+mice_grid <- seq(2,10, by = 2)         # number of mice 
+n_sim_reps <- 100                 # S 
+n_post_draws <- 1000             # T
+```
+
+```{r}
+##### Tolerance regions #####
+tolerance_region <- function(theta_draws,
+                             region = c("ellipse", "hypercube", "constant"),
+                             d, N_total, v_j) {
+  region <- match.arg(region)
+
+  # Posterior summaries from MCMC draws of the global theta
+  post_mean <- colMeans(theta_draws)          # posterior mean
+  n_draws   <- nrow(theta_draws)              # number of posterior draws
+  n_comp    <- length(post_mean)              # number of motifs 
+
+  if (region == "ellipse") {
+    # Case 1: Ellipse 
+    weight_safe <- pmax(post_mean, 1e-12)     
+    deviations  <- theta_draws - matrix(post_mean, n_draws, n_comp, byrow = TRUE)
+    quad_stat   <- rowSums((deviations^2) / matrix(weight_safe, n_draws, n_comp, byrow = TRUE))
+    return(mean(quad_stat <= d^2))
+
+  } else if (region == "hypercube") {
+    # Case 2: Hypercube  
+    v_total   <- sum(v_j)
+    post_se   <- sqrt(post_mean * (1 - post_mean) / (v_total + N_total + 1))
+    post_se   <- pmax(post_se, 1e-12)        
+    deviations_abs <- abs(theta_draws - matrix(post_mean, n_draws, n_comp, byrow = TRUE))
+    bounds         <- matrix(d * post_se, n_draws, n_comp, byrow = TRUE)
+    return(mean(apply(deviations_abs <= bounds, 1, all)))
+
+  } else {
+    # Case 3: Constant-width hypercube
+    bounds <- matrix(d, n_draws, n_comp, byrow = TRUE)
+    devabs <- abs(sweep(theta_draws, 2, post_mean, "-"))
+    mean(apply(devabs <= bounds, 1, all))
+  }
+}
+```
+
+```{r}
+##### MCMC function #####
+mcmc_dirichlet_hier <- function(n_counts, v, alpha,
+                                iter = 1000, burn = 100, thin = 2,
+                                tau = 50, adapt_warmup = 500,
+                                target_acc = c(0.2, 0.5)) {
+  n_counts <- as.matrix(n_counts)
+  M <- nrow(n_counts)
+  J <- ncol(n_counts)
+  v <- as.numeric(v)
+
+  # start global theta (vector)
+  init  <- v + colMeans(n_counts)
+  theta <- as.numeric(init / sum(init))
+
+  # first draw for each mouse
+  theta_i <- matrix(NA_real_, nrow = M, ncol = J)
+  for (i in seq_len(M)) {
+    theta_i[i, ] <- as.numeric(rdirichlet_safe(1, alpha * theta + n_counts[i, ]))
+  }
+
+  n_keep <- max(0L, floor((iter - burn) / thin))
+  out <- vector("list", length = n_keep)
+  k <- 0L
+  accepts <- 0L
+  total <- 0L
+
+  for (t in seq_len(iter)) {
+
+    # update each mouse given current global theta
+    for (i in seq_len(M)) {
+      theta_i[i, ] <- as.numeric(rdirichlet_safe(1, alpha * theta + n_counts[i, ]))
+    }
+
+    # propose theta' is approx Dir(tau * theta)
+    theta_prop <- as.numeric(rdirichlet_safe(1, tau * theta))
+
+    # log priors
+    log_prior_new <- ldirichlet_safe(theta_prop, v)
+    log_prior_old <- ldirichlet_safe(theta,      v)
+
+    # hierarchical terms 
+    log_hier_new <- sum(apply(theta_i, 1, function(th_i) ldirichlet_safe(th_i, alpha * theta_prop)))
+    log_hier_old <- sum(apply(theta_i, 1, function(th_i) ldirichlet_safe(th_i, alpha * theta)))
+
+    log_post_new <- log_prior_new + log_hier_new
+    log_post_old <- log_prior_old + log_hier_old
+
+    # Hastings correction for Dirichlet random-walk
+    log_q_new_given_old <- ldirichlet_safe(theta_prop, tau * theta)
+    log_q_old_given_new <- ldirichlet_safe(theta,      tau * theta_prop)
+
+    log_accept_ratio <- (log_post_new - log_post_old) + (log_q_old_given_new - log_q_new_given_old)
+    if (!is.finite(log_accept_ratio)) log_accept_ratio <- -Inf
+
+    if (log(runif(1)) < min(0, log_accept_ratio)) {
+      theta <- theta_prop
+      accepts <- accepts + 1L
+    }
+    total <- total + 1L
+
+    # adapt tau
+    if (t <= adapt_warmup) {
+      acc <- accepts / total
+      if (acc < target_acc[1])      tau <- tau * 1.10
+      else if (acc > target_acc[2]) tau <- tau * 0.90
+      tau <- min(max(tau, 5), 1e6)
+    }
+
+    # save
+    if (t > burn && ((t - burn) %% thin == 0)) {
+      k <- k + 1L
+      if (k <= n_keep) out[[k]] <- theta
+    }
+  }
+
+  draws <- if (length(out)) do.call(rbind, out) else matrix(theta, nrow = 1)
+  list(draws = draws, accept_rate = accepts / max(1L, total))
+}
+```
+
+```{r}
+##### MCMC simulation function #####
+run_grid_mcmc <- function(n_neurons, mice_grid, S, v_j, alpha_hier,
+                     iter, burn, thin, region = c("ellipse","hypercube","constant"), d,
+                     verbose = TRUE, print_every = 25,
+                     seed = NULL) {
+
+  if (!is.null(seed)) {
+    set.seed(seed)
+    RNGkind(kind = "Mersenne-Twister", normal.kind = "Inversion", sample.kind = "Rejection")
+  }
+
+  region <- match.arg(region)
+  pb <- progress_bar$new(
+    total = length(n_neurons) * length(mice_grid) * S,
+    format = "[:bar] :percent  (M=:M N=:N rep=:rep)"
+  )
+  # store results
+  results <- expand_grid(M = mice_grid, N = n_neurons) |>
+    mutate(mean_P = NA_real_, mean_acc = NA_real_)
+
+  for (r in seq_len(nrow(results))) {
+    M <- results$M[r]
+    N <- results$N[r]
+    N_total <- M * N
+    P_hats <- numeric(S)
+    accs <- numeric(S)
+    
+    # Loop over sample sizes
+    for (s in seq_len(S)) {
+      
+      # Simulate global theta from prior
+      theta_true <- rdirichlet_safe(1, v_j)   
+      
+      # mouse specfic motif proportions
+      thetas_i <- rdirichlet_safe(M, alpha_hier * as.numeric(theta_true))
+      
+      # simulate neuron motif counts
+      n_counts <- matrix(0L, nrow = M, ncol = length(v_j))
+      for (i in seq_len(M)) n_counts[i, ] <- rmultinom(1, size = N, prob = thetas_i[i, ])
+      
+      # compute posterior by MCMC
+      fit <- mcmc_dirichlet_hier(n_counts, v = v_j, alpha = alpha_hier,
+                                 iter = 1000, burn = 100, thin = 2)
+      
+      # tolerance region check
+      P_hats[s] <- tolerance_region(fit$draws, region = region, d = d,         
+                               N_total = N_total, v_j = v_j)
+      accs[s] <- fit$accept_rate
+      pb$tick(tokens = list(M = M, N = N, rep = s))
+      if (verbose && (s %% print_every == 0 || s == S)) {
+        message(glue("Interim: M={M}, N={N}, s={s}/{S} -> mean P_hat={round(mean(P_hats[1:s]), 3)}"))
+      }
+    }
+    
+    # Compute P(N)
+    results$mean_P[r]  <- mean(P_hats)                                     
+    results$mean_acc[r] <- mean(accs)
+    if (verbose) {
+      cat(sprintf("M=%d, N=%d -> P(N,M)=%.3f\n", M, N, results$mean_P[r]))
+    }
+  }
+  results
+}
+
+
+```
+
+```{r}
+##### Run MCMC sim #####
+
+res_mcmc_constant <- run_grid_mcmc(
+  n_neurons = n_neurons,
+  mice_grid = mice_grid,
+  S = n_sim_reps,
+  v_j = v_j,
+  alpha_hier = alpha_hier,
+  iter = 1000,
+  burn = 100,
+  thin = 2,
+  region = "constant",
+  d = 0.1,
+  verbose = TRUE,       
+  print_every = 5, 
+  seed = 123
+)
+
+```
+
+
+```{r}
+##### Plots #####
+p<- ggplot(res_mcmc_constant_,
+           aes(x = N, y = mean_P, colour = factor(M), group = factor(M))) +
+  geom_line(size = 1) +
+  geom_point(size = 1.5) +
+  geom_hline(yintercept = posterior_success_threshold,
+             linetype = "dashed", colour = "red") +
+  labs(title = "Posterior coverage vs N",
+       x = "Neurons per mouse (N)",
+       y = expression(hat(P)(N,M)),
+       colour = "Number of mice (M)") +   
+  theme_classic()
+
+# Save
+ggsave(filename = "~/Desktop/hans_constant_mcmc.png", plot = p, width = 8, height = 6, dpi = 300)
+```
+
+```{r}
+# filter rows that meet the criterion
+valid <- subset(res_mcmc_ellipse, mean_P >= posterior_success_threshold)
+
+# pick the minimum by N within each M
+min_by_M <- valid %>%
+  group_by(M) %>%
+  slice_min(N, with_ties = FALSE)
+
+print(min_by_M)
+
+# find the absolute minimum across all M, N
+min_overall <- valid %>%
+  mutate(total_neurons = M * N) %>%
+  slice_min(total_neurons, with_ties = FALSE)
+
+print(min_overall)
+```
+
+
+```{r}
+##### Laplace normal approximation function #####
+laplace_dirichlet_hier <- function(n_counts, v, alpha,
+                           n_draws = 1000,
+                           method = "BFGS",
+                           maxit = 2000,
+                           ridge = 1e-8,
+                           verbose = FALSE) {
+  stopifnot(is.matrix(n_counts))
+  v <- as.numeric(v)
+  M <- nrow(n_counts)
+  J <- ncol(n_counts)
+
+  # softmax 
+  softmax_from_eta <- function(eta) {
+    z <- c(eta, 0)
+    ez <- exp(z - max(z))
+    ez / sum(ez)
+  }
+
+  # log Dirichlet prior 
+  log_dirichlet <- function(theta, v) {
+    if (any(theta <= 0) || abs(sum(theta) - 1) > 1e-10) return(-Inf)
+    sum((v - 1) * log(theta)) + lgamma(sum(v)) - sum(lgamma(v))
+  }
+
+  # log Dirichlet–Multinomial term for one mouse
+  log_dm_one <- function(n_i, alpha_theta) {
+    Ni <- sum(n_i)
+    lgamma(sum(alpha_theta)) - lgamma(sum(alpha_theta) + Ni) +
+      sum(lgamma(alpha_theta + n_i) - lgamma(alpha_theta))
+  }
+
+  # negative log posterior 
+  neg_logpost_eta <- function(eta) {
+    theta <- softmax_from_eta(eta)
+    lp <- log_dirichlet(theta, v)
+    if (!is.finite(lp)) return(1e50)
+    a_th <- alpha * theta
+    ld <- 0
+    for (i in 1:M) ld <- ld + log_dm_one(n_counts[i, ], a_th)
+    log_J <- sum(log(theta))
+    -(lp + ld + log_J)
+  }
+
+  # init at prior mean
+  theta0 <- v / sum(v)
+  eta0 <- log(theta0[1:(J - 1)] / theta0[J])
+
+  # optimize
+  opt <- optim(par = eta0,
+               fn  = neg_logpost_eta,
+               method = method,
+               control = list(maxit = maxit, reltol = 1e-10))
+  if (verbose) message(sprintf("converged=%s; f=%.6f; iters=%d",
+                               opt$convergence == 0, opt$value, opt$counts[1]))
+  if (opt$convergence != 0) warning("optim did not report convergence.")
+
+  eta_hat <- opt$par
+
+  # Hessian and covariance 
+  H <- hessian(func = neg_logpost_eta, x = eta_hat)
+  
+  # symmetrize + ridge
+  H <- 0.5 * (H + t(H))
+  eig <- eigen(H, symmetric = TRUE)
+  lam <- pmax(eig$values, ridge)
+  H_pd <- eig$vectors %*% diag(lam, length(lam)) %*% t(eig$vectors)
+  Sigma_eta <- solve(H_pd)
+
+  eta_draws <- mvrnorm(n = n_draws, mu = eta_hat, Sigma = Sigma_eta)
+  if (is.null(dim(eta_draws))) eta_draws <- matrix(eta_draws, nrow = 1)
+  theta_draws <- t(apply(eta_draws, 1, softmax_from_eta))
+
+  list(mode_eta   = eta_hat,
+       mode_theta = softmax_from_eta(eta_hat),
+       Sigma_eta  = Sigma_eta,
+       draws      = theta_draws)
+}
+```
+
+```{r}
+##### Laplace normal approximation simulation function #####
+run_grid_laplace <- function(n_neurons, mice_grid, S, v_j, alpha_hier,
+                             n_draws, region = c("ellipse","hypercube","constant"),
+                             d, verbose = TRUE, print_every = 25, seed = NULL) {
+  if (!is.null(seed)) {
+    set.seed(seed)
+    RNGkind("Mersenne-Twister", "Inversion", "Rejection")
+  }
+
+  region <- match.arg(region)
+  pb <- progress::progress_bar$new(
+    total = length(n_neurons) * length(mice_grid) * S,
+    format = "[:bar] :percent  (M=:M N=:N rep=:rep)"
+  )
+  results <- tidyr::expand_grid(M = mice_grid, N = n_neurons) |>
+    mutate(mean_P = NA_real_, mean_acc = NA_real_)
+
+  for (r in seq_len(nrow(results))) {
+    M <- results$M[r]; N <- results$N[r]; N_total <- M * N
+    P_hats <- numeric(S)
+
+    for (s in seq_len(S)) {
+      # simulate truth
+      theta_true <- gtools::rdirichlet(1, v_j)
+      thetas_i   <- gtools::rdirichlet(M, alpha_hier * as.numeric(theta_true))
+
+      # simulate counts
+      n_counts <- t(apply(thetas_i, 1, function(p) rmultinom(1, size = N, prob = p)))
+
+      # Laplace posterior
+      fit <- laplace_dirichlet_hier(n_counts, v = v_j, alpha = alpha_hier, n_draws = n_draws)
+
+      # tolerance region
+      P_hats[s] <- tolerance_region(fit$draws,
+                                    region = region, d = d,
+                                    N_total = N_total, v_j = v_j)
+
+      pb$tick(tokens = list(M = M, N = N, rep = s))
+      if (verbose && (s %% print_every == 0 || s == S)) {
+        message(glue::glue("Interim (Laplace): M={M}, N={N}, s={s}/{S} -> mean P_hat={round(mean(P_hats[1:s]),3)}"))
+      }
+    }
+    results$mean_P[r] <- mean(P_hats)
+    if (verbose) {
+      cat(sprintf("Laplace M=%d, N=%d -> P(N,M)=%.3f\n", M, N, results$mean_P[r]))
+    }
+  }
+  results
+}
+```
+
+
+```{r}
+##### Run Laplace sim #####
+res_laplace_constant <- run_grid_laplace(
+  n_neurons = n_neurons,
+  mice_grid = mice_grid,
+  S = n_sim_reps,
+  v_j = v_j,
+  alpha_hier = alpha_hier,
+  region = "constant",  
+  n_draws = 200,
+  d = 0.05,
+  verbose = TRUE,
+  print_every = 5,
+  seed = 123
+)
+```
+
+```{r}
+##### Plots #####
+p <- ggplot(res_laplace_constant,
+           aes(x = N, y = mean_P, colour = factor(M), group = factor(M))) +
+  geom_line(size = 1) +
+  geom_point(size = 1.5) +
+  geom_hline(yintercept = posterior_success_threshold,
+             linetype = "dashed", colour = "red") +
+  labs(title = "Posterior coverage vs N",
+       x = "Neurons per mouse (N)",
+       y = expression(hat(P)(N,M)),
+       colour = "Number of mice (M)") +   
+  theme_classic()
+
+# Save
+  ggsave(filename = "~/Desktop/hans_constant_laplace.png", plot = p, width = 8, height = 6, dpi = 300)
+
+```
+
+```{r}
+# filter rows that meet the criterion
+valid <- subset(res_laplace_ellipse, mean_P >= posterior_success_threshold)
+
+# pick the minimum by N within each M
+min_by_M <- valid %>%
+  group_by(M) %>%
+  slice_min(N, with_ties = FALSE)
+
+print(min_by_M)
+
+# find the absolute minimum across all M, N
+min_overall <- valid %>%
+  mutate(total_neurons = M * N) %>%
+  slice_min(total_neurons, with_ties = FALSE)
+
+print(min_overall)
+```
+
+
+
+

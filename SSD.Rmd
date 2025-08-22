@@ -1,0 +1,330 @@
+---
+title: "SSD"
+output:
+  pdf_document: default
+  html_document: default
+date: "2025-07-14"
+---
+## Sample Size Estimation (Non-Hierarchical Adcock Method)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+##### Packages #####
+library(MCMCpack)
+library(matrixStats)
+library(DirichletReg)
+library(MASS)
+library(numDeriv)  
+library(Matrix)    
+library(extraDistr)
+library(gtools)
+library(ggplot2)
+```
+
+```{r}
+##### HBAMP informed priors #####
+omega_output <- mcmc_all_hans$omega_output
+omega_output_unlisted <- matrix(unlist(omega_output), nrow = 1001, ncol = 30)
+e_j <- apply(omega_output_unlisted, 2, mean) 
+alpha_noise <- mean(mcmc_all_hans$alpha_zero_output)
+v_j <- alpha_noise * e_j
+v <- sum(v_j)
+```
+
+```{r}
+##### Sample size analytical calculations #####
+alpha_region <- 0.05
+d <- 0.1
+
+# Case 1: Ellipsoid
+qchisq_val_case1 <- qchisq(1 - alpha_region, df = J - 1)
+n_required_case1 <- ceiling(qchisq_val_case1 / d^2 - v - 1)
+
+# Case 2: Hypercube 
+qchisq_val_case2 <- qchisq(1 - alpha_region / J, df = 2)
+n_required_case2 <- ceiling(qchisq_val_case2 / d^2 - v - 1)
+
+# Case 3: Hypercube Width
+qchisq_val_case3 <- qchisq(1 - alpha_region / (2 * J), df = 2)
+n_required_case3 <- ceiling(qchisq_val_case3 / (4 * d^2) - v - 1)
+
+# results
+cat("==== Required Sample Size Estimates ====\n")
+cat("Case 1 (Ellipsoid):", n_required_case1, "neurons\n")
+cat("Case 2 (Hypercube - SE):", n_required_case2, "neurons\n")
+cat("Case 3 (Hypercube - Width):", n_required_case3, "neurons")
+```
+
+```{r}
+##### Tolerance regions #####
+# Ellipsoid region function
+ellipse_region <- function(theta, post_mean, d) {
+  stat <- sum((theta - post_mean)^2 / post_mean)
+  return(stat <= d^2)
+}
+
+# Hypercube region function 
+hypercube_region <- function(theta_draw, post_mean, N, v, d) {
+  J <- length(post_mean)
+  se <- sqrt(pmax(post_mean * (1 - post_mean) / (v + N + 1)))
+  idx <- seq_len(J - 1L)
+  all( abs(theta_draw[idx] - post_mean[idx]) / se[idx] <= d )
+}
+
+# Constant width hypercube region function
+constant_region <- function(theta, post_mean, d) {
+  return(all(abs(theta - post_mean) <= d))
+}
+```
+
+```{r}
+##### Simulation (single-mouse) #####
+# Grid & Monte Carlo settings
+n_neurons   <- seq(0, 10000, by = 250)
+n_sim_reps  <- 100  # S
+n_post_draws <- 1000  # T
+d <-0.1    
+success_rates <- numeric(length(n_neurons))
+posterior_success_threshold <- 0.95
+
+# Main simulation loop
+run_single_mouse <- function(region, n_neurons, n_sim_reps, n_post_draws, d, v_j, v) {
+  region <- match.arg(region, c("ellipse","hypercube_region","constant"))  # validate
+  success_rates <- numeric(length(n_neurons))
+
+  for (i in seq_along(n_neurons)) {
+    N <- n_neurons[i]
+    P_hats <- numeric(n_sim_reps)
+
+    for (s in seq_len(n_sim_reps)) {
+      theta_true  <- as.vector(rdirichlet(1, v_j))                
+      counts      <- as.vector(rmultinom(1, size = N, prob = theta_true))
+      post_params <- v_j + counts
+      post_mean   <- post_params / sum(post_params)
+      theta_post  <- rdirichlet(n_post_draws, post_params)       
+
+      inside <- logical(n_post_draws)
+      if (region == "ellipse") {
+        for (t in seq_len(n_post_draws))
+          inside[t] <- ellipse_region(theta_post[t, ], post_mean, d)          
+      } else if (region == "hypercube_region") {
+        for (t in seq_len(n_post_draws))
+          inside[t] <- hypercube_region(theta_post[t, ], post_mean, N, v, d)   
+      } else if (region == "constant") {
+        for (t in seq_len(n_post_draws))
+          inside[t] <- constant_region(theta_post[t, ], post_mean, d)
+      }
+      P_hats[s] <- mean(inside)
+    }
+    success_rates[i] <- mean(P_hats)
+    cat(sprintf("[%s] N=%d: P(N)=%.3f\n",region, N, success_rates[i]))        
+  }
+  success_rates
+}
+```
+
+```{r}
+##### Run sim #####
+res_ellipse_single_mouse <-
+  run_single_mouse("ellipse", 
+                   n_neurons, 
+                   n_sim_reps, 
+                   n_post_draws, 
+                   d,
+                   v_j, 
+                   v)
+```
+
+```{r}
+##### Plots #####
+plot(n_neurons, res_ellipse_single_mouse, type = "b", pch = 16,
+     xlab = "Sample Size N", ylab = "P(N)",
+     main = "Posterior Region Coverage vs Sample Size")
+abline(h = posterior_success_threshold, col = "red", lty = 2)
+text(max(n_neurons), posterior_success_threshold, labels = paste0("1 - alpha"),
+     pos = 1, col = "red")
+```
+
+# Plots for the report
+```{r}
+df_sim <- data.frame(N = n_neurons, P_hat = res_ellipse)
+
+# Normal-approx "coverage curve"
+P_norm <- pchisq(d^2 * (df_sim$N + v + 1), df = J - 1)
+
+df_both <- rbind(
+  data.frame(N = df_sim$N, P = df_sim$P_hat, Method = "Simulation"),
+  data.frame(N = df_sim$N, P = P_norm,       Method = "Normal approx")
+)
+
+ggplot(df_both, aes(N, P, colour = Method)) +
+  geom_line(size = 1) +
+  geom_hline(yintercept = 0.95, linetype = "dashed", colour = "red") +
+  geom_vline(xintercept = n_required_case1, linetype = "dotted", colour = "blue") +
+  labs(title = "Single-mouse: simulation vs normal-approximation (ellipsoid)",
+       x = "Neurons per mouse (N)",
+       y = expression(hat(P)(N))) +
+  theme_classic()
+
+ggsave("~/Desktop/single_ellipse_sim_plot.png", width = 6, height = 4, dpi = 300)
+
+```
+
+```{r}
+##### Shrinkage #####
+N_grid <- seq(0, 2000, by = 50)
+w <- v / (v + N_grid)
+plot(N_grid, w, type = "l", xlab = "N (neurons)", ylab = "Shrinkage weight v/(v+N)",
+     main = "Shrinkage toward prior vs sample size")
+```
+
+```{r}
+##### Ellipse plot #####
+# posterior mean
+phi1 <- 0.50
+phi2 <- 0.30
+d_vals <- c(0.10, 0.05)
+
+# build ellipsoid
+ell <- do.call(rbind, lapply(d_vals, function(d){
+  a <- d*sqrt(phi1)
+  b <- d*sqrt(phi2)
+  t <- seq(0, 2*pi, length.out = 400)
+  data.frame(p1 = phi1 + a*cos(t),
+             p2 = phi2 + b*sin(t),
+             d  = paste0("d = ", d))
+}))
+
+# centres
+centres <- data.frame(p1 = phi1, p2 = phi2, d = paste0("d = ", d_vals))
+
+# Plot 
+ggplot(ell, aes(p1, p2)) +
+  geom_abline(intercept = 1, slope = -1, linetype = "dashed") +
+  geom_path(colour = "red", linewidth = 1) +
+  geom_point(data = centres, aes(p1, p2), inherit.aes = FALSE, size = 2) +
+  coord_fixed(xlim = c(0, 1), ylim = c(0, 1), clip = "on") +
+  facet_wrap(~ d, nrow = 1) +
+  labs(title = "Elliptical Tolerance Region for J = 3",
+       x = expression(p[1]),
+       y = expression(p[2])) +
+  theme(
+    panel.background = element_rect(fill = "white", colour = "black"),
+    panel.grid = element_blank(),
+    axis.line = element_line(colour = "black"),
+    strip.background = element_rect(fill = "white", colour = "black"),
+    strip.text = element_text(colour = "black"),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+# Save
+ggsave("~/Desktop/ellipse_plot.png", width = 6, height = 4, dpi = 300)
+```
+
+```{r}
+##### Hypercube plot #####
+# centre and d
+phi1 <- 0.70
+phi2 <- 0.15
+d    <- 0.10
+
+make_segments <- function(d){
+  w1 <- d * sqrt(phi1 * (1 - phi1))
+  w2 <- d * sqrt(phi2 * (1 - phi2))
+
+  xL <- max(0, phi1 - w1); xR <- min(1, phi1 + w1)
+  yB <- max(0, phi2 - w2); yT <- min(1, phi2 + w2)
+
+  v1_y0 <- max(0, yB); v1_y1 <- min(yT, 1 - xL)
+  v2_y0 <- max(0, yB); v2_y1 <- min(yT, 1 - xR)
+
+  h1_x0 <- max(0, xL); h1_x1 <- min(xR, 1 - yB)
+  h2_x0 <- max(0, xL); h2_x1 <- min(xR, 1 - yT)
+
+  rbind(
+    data.frame(x=xL, xend=xL, y=v1_y0, yend=v1_y1),
+    data.frame(x=xR, xend=xR, y=v2_y0, yend=v2_y1),
+    data.frame(x=h1_x0, xend=h1_x1, y=yB, yend=yB),
+    data.frame(x=h2_x0, xend=h2_x1, y=yT, yend=yT)
+  )
+}
+
+segs    <- make_segments(d)
+centre  <- data.frame(p1 = phi1, p2 = phi2)
+
+ggplot() +
+  geom_abline(intercept = 1, slope = -1, linetype = "dashed") +      
+  geom_segment(data = segs, aes(x=x, y=y, xend=xend, yend=yend),
+               colour = "red", linewidth = 1) +                       # hypercube edges
+  geom_point(data = centre, aes(p1, p2), size = 2) +                  # centre
+  coord_fixed(xlim = c(0,1), ylim = c(0,1), clip = "on") +
+  labs(title = "Hypercube Tolerance Region (J = 3, d = 0.10)",
+       x = expression(p[1]), y = expression(p[2])) +
+  theme(
+    panel.background = element_rect(fill = "white", colour = "black"),
+    panel.grid = element_blank(),
+    axis.line = element_line(colour = "black"),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+# Save
+ggsave("~/Desktop/hypercube2_plot.png", width = 6, height = 4, dpi = 300)
+```
+
+```{r}
+##### Hypercube fixed width plot #####
+# Fixed width tolerance 
+phi1 <- 0.50
+phi2 <- 0.30
+d_vals <- 0.10  
+
+# Build rectangle edges 
+make_segments_fixed <- function(d){
+  w1 <- d; w2 <- d                    
+  xL <- max(0,   phi1 - w1); xR <- min(1,   phi1 + w1)
+  yB <- max(0,   phi2 - w2); yT <- min(1,   phi2 + w2)
+  
+  rbind(
+    data.frame(x=xL, xend=xL,
+               y=max(0, yB), yend=min(yT, 1 - xL), d=paste0("d = ", d)),
+    data.frame(x=xR, xend=xR,
+               y=max(0, yB), yend=min(yT, 1 - xR), d=paste0("d = ", d)),
+    data.frame(x=max(0, xL), xend=min(xR, 1 - yB),
+               y=yB, yend=yB, d=paste0("d = ", d)),
+    data.frame(x=max(0, xL), xend=min(xR, 1 - yT),
+               y=yT, yend=yT, d=paste0("d = ", d))
+  )
+}
+
+segs <- make_segments_fixed(d_vals)
+segs <- subset(segs, x < xend | y < yend) 
+centres <- data.frame(p1=phi1, p2=phi2)
+
+ggplot() +
+  geom_abline(intercept=1, slope=-1, linetype="dashed") +
+  geom_segment(data=segs, aes(x=x,y=y,xend=xend,yend=yend),
+               colour="red", linewidth=1) +
+  # centre
+  geom_point(data=centres, aes(p1,p2), size=2) +
+  coord_fixed(xlim=c(0,1), ylim=c(0,1), clip="on") +
+  labs(title="Fixed-Width Hypercube (J = 3, d = 0.1)",
+       x=expression(p[1]), y=expression(p[2])) +
+  theme(
+    panel.background = element_rect(fill="white", colour="black"),
+    panel.grid = element_blank(),
+    axis.line = element_line(colour="black"),
+    strip.background = element_rect(fill="white", colour="black"),
+    strip.text = element_text(colour="black"),
+    plot.title = element_text(hjust=0.5, face="bold")
+  )
+
+# Save
+ggsave("~/Desktop/fixed_width_plot.png", width = 6, height = 4, dpi = 300)
+```
+
+
+
+
